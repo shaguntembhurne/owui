@@ -140,6 +140,16 @@ This will start the Open WebUI server, which you can access at [http://localhost
 
 ### Installation with Default Configuration
 
+### University email OTP sign-in
+
+OTP sign-in is disabled by default. To enable it for a local development
+instance, copy `.env.example` to `.env`, set `OTP_AUTH_ENABLED=true`, provide
+the SMTP settings, and set `OTP_ALLOWED_EMAIL_DOMAINS` to the approved
+university domains. Gmail requires 2-Step Verification and a Google App
+Password; use that app password in `OTP_SMTP_PASSWORD`, not the normal Gmail
+password. Never commit `.env` or share its values. Restart Open WebUI after
+changing these variables so the backend reloads the configuration.
+
 - **If Ollama is on your computer**, use this command:
 
   ```bash

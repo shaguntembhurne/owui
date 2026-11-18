@@ -341,6 +341,42 @@ export const userSignIn = async (email: string, password: string) => {
 	return res;
 };
 
+export const getOtpConfig = async () => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/otp/config`);
+	if (!res.ok) {
+		throw await res.json();
+	}
+	return res.json();
+};
+
+export const requestOtp = async (email: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/otp/request`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		credentials: 'include',
+		body: JSON.stringify({ email })
+	});
+	if (!res.ok) {
+		const error = await res.json();
+		throw error.detail;
+	}
+	return res.json();
+};
+
+export const verifyOtp = async (email: string, code: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/otp/verify`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		credentials: 'include',
+		body: JSON.stringify({ email, code })
+	});
+	if (!res.ok) {
+		const error = await res.json();
+		throw error.detail;
+	}
+	return res.json();
+};
+
 export const userSignUp = async (
 	name: string,
 	email: string,

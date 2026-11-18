@@ -16,6 +16,9 @@
 	import {
 		ldapUserSignIn,
 		getSessionUser,
+		getOtpConfig,
+		requestOtp,
+		verifyOtp,
 		userSignIn,
 		userSignUp,
 		updateUserTimezone
@@ -45,6 +48,9 @@
 	let confirmPassword = '';
 
 	let ldapUsername = '';
+	let otpCode = '';
+	let otpLength = 6;
+	let otpEnabled = false;
 
 	let submitting = false;
 
@@ -118,6 +124,24 @@
 		await setSessionUser(sessionUser);
 	};
 
+	const requestOtpHandler = async () => {
+		try {
+			await requestOtp(email);
+			toast.success($i18n.t('A sign-in code has been sent to your email.'));
+			mode = 'otp-verify';
+		} catch (error) {
+			toast.error(`${error}`);
+		}
+	};
+
+	const verifyOtpHandler = async () => {
+		const sessionUser = await verifyOtp(email, otpCode).catch((error) => {
+			toast.error(`${error}`);
+			return null;
+		});
+		await setSessionUser(sessionUser);
+	};
+
 	const submitHandler = async () => {
 		if (submitting) {
 			return;
@@ -127,6 +151,10 @@
 		try {
 			if (mode === 'ldap') {
 				await ldapSignInHandler();
+			} else if (mode === 'otp') {
+				await requestOtpHandler();
+			} else if (mode === 'otp-verify') {
+				await verifyOtpHandler();
 			} else if (mode === 'signin') {
 				await signInHandler();
 			} else {
@@ -200,6 +228,13 @@
 		}
 		if (!logout) await oauthCallbackHandler();
 		form = $page.url.searchParams.get('form');
+		try {
+			const otpConfig = await getOtpConfig();
+			otpEnabled = otpConfig.enabled;
+			otpLength = otpConfig.length;
+		} catch {
+			otpEnabled = false;
+		}
 
 		// Auto-redirect to SSO when OAUTH_AUTO_REDIRECT is enabled and the
 		// deployment is unambiguously SSO-only (single provider, no login form,
@@ -322,6 +357,8 @@
 											{$i18n.t(`Get started with {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
 										{:else if mode === 'ldap'}
 											{$i18n.t(`Sign in to {{WEBUI_NAME}} with LDAP`, { WEBUI_NAME: $WEBUI_NAME })}
+										{:else if mode === 'otp' || mode === 'otp-verify'}
+											{$i18n.t(`Sign in with university email`, { WEBUI_NAME: $WEBUI_NAME })}
 										{:else if mode === 'signin'}
 											{$i18n.t(`Sign in to {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
 										{:else}
@@ -398,7 +435,8 @@
 											</div>
 										{/if}
 
-										<div>
+										{#if mode !== 'otp' && mode !== 'otp-verify'}
+											<div>
 											<label
 												for="password"
 												class="text-[0.8125rem] leading-5 font-normal text-left mb-1 block"
@@ -416,7 +454,28 @@
 												required
 												aria-required="true"
 											/>
-										</div>
+											</div>
+										{:else if mode === 'otp-verify'}
+											<div class="mb-2">
+												<label
+													for="otp-code"
+													class="text-[0.8125rem] leading-5 font-normal text-left mb-1 block"
+													>{$i18n.t('Sign-in code')}</label
+												>
+												<input
+													bind:value={otpCode}
+													type="text"
+													id="otp-code"
+													class="my-0.5 w-full text-[0.8125rem] leading-5 outline-hidden bg-transparent placeholder:text-gray-300 dark:placeholder:text-gray-600"
+													inputmode="numeric"
+													autocomplete="one-time-code"
+													pattern={`\\d{${otpLength}}`}
+													maxlength={otpLength}
+													placeholder={$i18n.t(`Enter your ${otpLength}-digit code`)}
+													required
+												/>
+											</div>
+										{/if}
 
 										{#if mode === 'signup' && $config?.features?.enable_signup_password_confirmation}
 											<div class="mt-2">
@@ -455,6 +514,32 @@
 													</div>
 												{/if}
 											</button>
+										{:else if mode === 'otp'}
+											<button
+												class="bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-normal text-[0.8125rem] leading-5 py-2.5 disabled:opacity-50 flex justify-center"
+												type="submit"
+												disabled={submitting}
+											>
+												<div class="self-center">{$i18n.t('Send sign-in code')}</div>
+												{#if submitting}<div class="ml-1.5 self-center"><Spinner /></div>{/if}
+											</button>
+										{:else if mode === 'otp-verify'}
+											<button
+												class="bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-normal text-[0.8125rem] leading-5 py-2.5 disabled:opacity-50 flex justify-center"
+												type="submit"
+												disabled={submitting}
+											>
+												<div class="self-center">{$i18n.t('Verify and sign in')}</div>
+												{#if submitting}<div class="ml-1.5 self-center"><Spinner /></div>{/if}
+											</button>
+											<button
+												class="mt-3 flex justify-center items-center text-xs w-full text-center underline"
+												type="button"
+												on:click={() => {
+													mode = 'otp';
+													otpCode = '';
+												}}>{$i18n.t('Resend code')}</button
+											>
 										{:else}
 											<button
 												class="bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-normal text-[0.8125rem] leading-5 py-2.5 disabled:opacity-50 flex justify-center"
@@ -501,6 +586,21 @@
 									{/if}
 								</div>
 							</form>
+
+							{#if otpEnabled && (mode === 'signin' || mode === 'otp' || mode === 'otp-verify')}
+								<button
+									class="mt-4 flex justify-center items-center text-xs w-full text-center underline"
+									type="button"
+									on:click={() => {
+										mode = mode === 'signin' ? 'otp' : 'signin';
+										otpCode = '';
+									}}
+								>
+									{mode === 'signin'
+										? $i18n.t('Sign in with university email')
+										: $i18n.t('Use password sign-in')}
+								</button>
+							{/if}
 
 							{#if Object.keys($config?.oauth?.providers ?? {}).length > 0}
 								<div class="inline-flex items-center justify-center w-full">

@@ -826,6 +826,24 @@ PASSWORD_VALIDATION_REGEX_PATTERN = os.getenv(
     r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^\w\s]).{8,}$',
 )
 
+# University email OTP authentication. OTP state is stored in the application database.
+OTP_AUTH_ENABLED = os.getenv('OTP_AUTH_ENABLED', 'False').lower() == 'true'
+OTP_SMTP_HOST = os.getenv('OTP_SMTP_HOST', '')
+OTP_SMTP_PORT = int(os.getenv('OTP_SMTP_PORT', '587'))
+OTP_SMTP_USERNAME = os.getenv('OTP_SMTP_USERNAME', '')
+OTP_SMTP_PASSWORD = os.getenv('OTP_SMTP_PASSWORD', '')
+OTP_EMAIL_FROM = os.getenv('OTP_EMAIL_FROM', OTP_SMTP_USERNAME)
+OTP_SMTP_USE_TLS = os.getenv('OTP_SMTP_USE_TLS', 'True').lower() == 'true'
+OTP_LENGTH = int(os.getenv('OTP_LENGTH', '6'))
+OTP_EXPIRY_SECONDS = int(os.getenv('OTP_EXPIRY_SECONDS', '300'))
+OTP_MAX_ATTEMPTS = int(os.getenv('OTP_MAX_ATTEMPTS', '5'))
+OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv('OTP_RESEND_COOLDOWN_SECONDS', '60'))
+OTP_ALLOWED_EMAIL_DOMAINS = tuple(
+    domain.strip().lower().lstrip('@')
+    for domain in os.getenv('OTP_ALLOWED_EMAIL_DOMAINS', '').split(',')
+    if domain.strip()
+)
+
 
 try:
     PASSWORD_VALIDATION_REGEX_PATTERN = rf'{PASSWORD_VALIDATION_REGEX_PATTERN}'

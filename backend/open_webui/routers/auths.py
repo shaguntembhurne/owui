@@ -1,9 +1,17 @@
+""""Auth Routes Changes for Open WebUI for university email OTP and LDAP authentication.
+Everything else is based on the original code from Open WebUI, with modifications to support university email OTP and LDAP authentication.
+all the changes are highlighted with comments in the code. some small changes are ignored cause they are not that imp"""
+
 from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
+import hmac
 import logging
 import re
+import secrets
+import smtplib
 import time
 import urllib
 import uuid
@@ -21,6 +29,19 @@ from open_webui.config import (
     OAUTH_PROVIDERS,
 )
 from open_webui.constants import ERROR_MESSAGES
+"""changes done in import OTP_ALLOWED_EMAIL_DOMAINS,
+    OTP_AUTH_ENABLED,
+    OTP_EMAIL_FROM,
+    OTP_EXPIRY_SECONDS,
+    OTP_LENGTH,
+    OTP_MAX_ATTEMPTS,
+    OTP_RESEND_COOLDOWN_SECONDS,
+    OTP_SMTP_HOST,
+    OTP_SMTP_PASSWORD,
+    OTP_SMTP_PORT,
+    OTP_SMTP_USE_TLS,
+    OTP_SMTP_USERNAME,
+    WEBUI_SECRET_KEY,"""
 from open_webui.env import (
     AIOHTTP_CLIENT_SESSION_SSL,
     ENABLE_INITIAL_ADMIN_SIGNUP,
@@ -28,6 +49,18 @@ from open_webui.env import (
     OAUTH_TOKEN_EXCHANGE_RATE_LIMIT,
     OAUTH_TOKEN_EXCHANGE_RATE_LIMIT_WINDOW,
     OAUTH_TOKEN_EXCHANGE_TRUSTED_CLIENT_IDS,
+    OTP_ALLOWED_EMAIL_DOMAINS,
+    OTP_AUTH_ENABLED,
+    OTP_EMAIL_FROM,
+    OTP_EXPIRY_SECONDS,
+    OTP_LENGTH,
+    OTP_MAX_ATTEMPTS,
+    OTP_RESEND_COOLDOWN_SECONDS,
+    OTP_SMTP_HOST,
+    OTP_SMTP_PASSWORD,
+    OTP_SMTP_PORT,
+    OTP_SMTP_USE_TLS,
+    OTP_SMTP_USERNAME,
     WEBUI_AUTH,
     WEBUI_AUTH_COOKIE_SAME_SITE,
     WEBUI_AUTH_COOKIE_SECURE,
@@ -36,6 +69,7 @@ from open_webui.env import (
     WEBUI_AUTH_TRUSTED_GROUPS_HEADER,
     WEBUI_AUTH_TRUSTED_NAME_HEADER,
     WEBUI_AUTH_TRUSTED_ROLE_HEADER,
+    WEBUI_SECRET_KEY,
 )
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
@@ -54,6 +88,7 @@ from open_webui.models.auths import (
 from open_webui.models.config import Config
 from open_webui.models.groups import Groups
 from open_webui.models.oauth_sessions import OAuthSessions
+from open_webui.models.otp import OtpChallenges
 from open_webui.models.users import (
     UpdateProfileForm,
     UserModel,
@@ -165,6 +200,56 @@ LDAP_SERVER_CONFIG_KEYS = {
     'attribute_for_groups': 'ldap.server.attribute_for_groups',
 }
 
+#-------changes for OTP email authentication ----
+class OtpEmailForm(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class OtpVerifyForm(OtpEmailForm):
+    code: str = Field(min_length=1, max_length=12)
+
+
+class OtpConfigResponse(BaseModel):
+    enabled: bool
+    length: int
+
+
+def _normalize_otp_email(email: str) -> str:
+    normalized = email.strip().lower()
+    if not validate_email_format(normalized):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Enter a valid university email address.')
+    domain = normalized.rsplit('@', 1)[1]
+    if not OTP_ALLOWED_EMAIL_DOMAINS or domain not in OTP_ALLOWED_EMAIL_DOMAINS:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail='This email domain is not eligible for OTP sign-in.')
+    return normalized
+
+
+def _otp_hash(email: str, code: str) -> str:
+    return hmac.new(
+        WEBUI_SECRET_KEY.encode('utf-8'),
+        f'{email}:{code}'.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _send_otp_email(email: str, code: str) -> None:
+    if not all((OTP_SMTP_HOST, OTP_SMTP_USERNAME, OTP_SMTP_PASSWORD, OTP_EMAIL_FROM)):
+        raise RuntimeError('OTP SMTP is not configured')
+    message = (
+        f'From: {OTP_EMAIL_FROM}\r\n'
+        f'To: {email}\r\n'
+        'Subject: Your Open WebUI sign-in code\r\n'
+        'Content-Type: text/plain; charset=utf-8\r\n'
+        '\r\n'
+        f'Your one-time sign-in code is {code}. It expires in {OTP_EXPIRY_SECONDS // 60} minutes.\r\n'
+        'If you did not request this code, you can safely ignore this email.\r\n'
+    )
+    with smtplib.SMTP(OTP_SMTP_HOST, OTP_SMTP_PORT, timeout=15) as smtp:
+        if OTP_SMTP_USE_TLS:
+            smtp.starttls()
+        smtp.login(OTP_SMTP_USERNAME, OTP_SMTP_PASSWORD)
+        smtp.sendmail(OTP_EMAIL_FROM, [email], message)
+#---- end ----
 
 async def get_config_values(key_map: dict[str, str]) -> dict:
     values = await Config.get_many(*key_map.values())
@@ -174,6 +259,118 @@ async def get_config_values(key_map: dict[str, str]) -> dict:
 def config_updates(data: dict, key_map: dict[str, str]) -> dict:
     return {key_map[field]: value for field, value in data.items() if field in key_map}
 
+#-------changes for OTP email authentication ----
+@router.get('/otp/config', response_model=OtpConfigResponse)
+async def otp_config():
+    return {'enabled': OTP_AUTH_ENABLED, 'length': OTP_LENGTH}
+
+
+@router.post('/otp/request')
+async def request_otp(form_data: OtpEmailForm, db: AsyncSession = Depends(get_async_session)):
+    if not OTP_AUTH_ENABLED:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail='OTP sign-in is not enabled.')
+
+    email = _normalize_otp_email(form_data.email)
+    now = int(time.time())
+    latest = await OtpChallenges.get_latest_active(email, db=db)
+    if latest and now - latest.created_at < OTP_RESEND_COOLDOWN_SECONDS:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail='Please wait before requesting another code.',
+        )
+    if await OtpChallenges.count_recent(email, now - 15 * 60, db=db) >= 5:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, detail='Too many OTP requests. Try again later.')
+
+    code = ''.join(str(secrets.randbelow(10)) for _ in range(OTP_LENGTH))
+    challenge = await OtpChallenges.create(
+        email,
+        _otp_hash(email, code),
+        now,
+        now + OTP_EXPIRY_SECONDS,
+        db=db,
+    )
+    try:
+        await asyncio.to_thread(_send_otp_email, email, code)
+    except Exception:
+        await OtpChallenges.invalidate(challenge.id, db=db)
+        log.error('OTP email delivery failed')
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Unable to send the sign-in code. Please try again later.',
+        )
+    return {'message': 'If the address is eligible, a sign-in code has been sent.'}
+
+
+@router.post('/otp/verify', response_model=SigninResult)
+async def verify_otp(  # noqa: C901
+    request: Request,
+    response: Response,
+    form_data: OtpVerifyForm,
+    db: AsyncSession = Depends(get_async_session),
+):
+    if not OTP_AUTH_ENABLED:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail='OTP sign-in is not enabled.')
+
+    email = _normalize_otp_email(form_data.email)
+    if not form_data.code.isdigit() or len(form_data.code) != OTP_LENGTH:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Invalid or expired sign-in code.')
+
+    challenge = await OtpChallenges.get_latest_active(email, db=db)
+    if not challenge or challenge.expires_at <= int(time.time()) or challenge.attempts >= OTP_MAX_ATTEMPTS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Invalid or expired sign-in code.')
+
+    valid = await OtpChallenges.consume_if_valid(
+        challenge.id,
+        email,
+        _otp_hash(email, form_data.code),
+        int(time.time()),
+        OTP_MAX_ATTEMPTS,
+        db=db,
+    )
+    if not valid:
+        attempts = await OtpChallenges.record_attempt(challenge.id, db=db)
+        if attempts is not None and attempts >= OTP_MAX_ATTEMPTS:
+            await OtpChallenges.invalidate(challenge.id, db=db)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Invalid or expired sign-in code.')
+
+    user = await Users.get_user_by_email(email, db=db)
+    if not user:
+        if not await Config.get('ui.enable_signup'):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail='Account registration is disabled.')
+        try:
+            user = await Auths.insert_new_auth(
+                email=email,
+                password=await get_password_hash(secrets.token_urlsafe(32)),
+                name=email.split('@', 1)[0],
+                role='user',
+                db=db,
+            )
+        except IntegrityError:
+            user = await Users.get_user_by_email(email, db=db)
+        if not user:
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=ERROR_MESSAGES.CREATE_USER_ERROR)
+        await apply_default_group_assignment(await Config.get('ui.default_group_id'), user.id, db=db)
+        await publish_event(
+            request,
+            EVENTS.USER_CREATED,
+            actor=user,
+            subject_id=user.id,
+            source='otp',
+            data={'role': user.role},
+        )
+
+    authenticated_user = await Auths.authenticate_user_by_email(email, db=db)
+    if not authenticated_user:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.INVALID_CRED)
+    return await create_signin_response(
+        request,
+        authenticated_user,
+        db,
+        response,
+        set_cookie=True,
+        source='otp',
+    )
+# ----- end -----
 
 @router.get('/', response_model=SessionUserInfoResponse)
 async def get_session_user(
@@ -210,7 +407,9 @@ async def get_session_user(
         response.set_cookie(
             key='token',
             value=token,
-            expires=(datetime.datetime.fromtimestamp(expires_at, datetime.timezone.utc) if expires_at else None),
+            #-------changes for OTP email authentication ----
+            expires=(datetime.datetime.fromtimestamp(expires_at, datetime.UTC) if expires_at else None),
+            # --- end ---
             httponly=True,  # Ensures the cookie is not accessible via JavaScript
             samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
             secure=WEBUI_AUTH_COOKIE_SECURE,
@@ -688,7 +887,7 @@ async def signin(
             name = request.headers.get(WEBUI_AUTH_TRUSTED_NAME_HEADER, email)
             try:
                 name = urllib.parse.unquote(name, encoding='utf-8')
-            except Exception as e:
+            except Exception:
                 pass
 
         if not await Users.get_user_by_email(email.lower(), db=db):
@@ -1681,7 +1880,7 @@ async def token_exchange(
     sub_claim = await Config.get('oauth.sub_claim')
     sub = user_data.get(sub_claim or OAUTH_PROVIDERS[provider].get('sub_claim', 'sub'))
     if not sub:
-        log.warning(f'Token exchange failed: sub claim missing from user data')
+        log.warning('Token exchange failed: sub claim missing from user data')
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Token missing required 'sub' claim",
@@ -1690,7 +1889,7 @@ async def token_exchange(
 
     email = user_data.get(email_claim, '')
     if not email:
-        log.warning(f'Token exchange failed: email claim missing from user data')
+        log.warning('Token exchange failed: email claim missing from user data')
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Token missing required email claim',
@@ -1702,7 +1901,7 @@ async def token_exchange(
     if isinstance(oauth_allowed_domains, str):
         oauth_allowed_domains = [domain.strip() for domain in oauth_allowed_domains.split(',') if domain.strip()]
     if '*' not in oauth_allowed_domains and email.split('@')[-1] not in oauth_allowed_domains:
-        log.warning(f'Token exchange denied: email domain not in allowed domains list')
+        log.warning('Token exchange denied: email domain not in allowed domains list')
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
